@@ -1,0 +1,105 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = "monudocker334/devopsexamapp:latest"
+        SCANNER_HOME = tool 'sonar-scanner'
+    }
+
+    stages {
+        stage('Git Checkout') {
+            steps {
+                git url: 'https://github.com/KastroVKiran/devops-exam-app.git', 
+                    branch: 'master'
+            }
+        }
+
+        stage('Verify Docker Compose') {
+            steps {
+                sh '''
+                    docker compose version || docker-compose version || { echo "Docker Compose not available"; exit 1; }
+                '''
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                          -Dsonar.projectName=devops-exam-app \
+                          -Dsonar.projectKey=devops-exam-app \
+                          -Dsonar.sources=. \
+                          -Dsonar.python.version=3
+                    """
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('backend') {
+                    script {
+                        withDockerRegistry(credentialsId: 'docker-creds', toolName: 'docker') {
+                            sh "docker build -t ${DOCKER_IMAGE} ."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-creds', toolName: 'docker') {
+                        sh "docker push ${DOCKER_IMAGE}"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy with Docker Compose') {
+            steps {
+                sh '''
+                    docker compose down --remove-orphans || true
+                    docker compose pull || true
+                    docker compose up -d
+
+                    echo "Waiting for MySQL to be ready..."
+                    timeout 120s bash -c '
+                        until docker compose exec -T mysql mysqladmin ping -uroot -prootpass --silent 2>/dev/null; do
+                            sleep 5
+                            docker compose logs mysql --tail=5 || true
+                        done'
+
+                    echo "Waiting for Flask app to be ready..."
+                    timeout 60s bash -c '
+                        until curl -sf http://localhost:5000; do
+                            sleep 5
+                            echo "Waiting for Flask endpoint..."
+                        done'
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    echo "=== Container Status ==="
+                    docker compose ps -a
+                    echo "=== Testing Flask Endpoint ==="
+                    curl -I http://localhost:5000 || { echo "Flask endpoint not reachable"; exit 1; }
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline finished."
+        }
+        failure {
+            echo "Pipeline failed!"
+        }
+    }
+}
